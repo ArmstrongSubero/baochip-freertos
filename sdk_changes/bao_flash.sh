@@ -1,0 +1,585 @@
+#!/bin/bash
+# bao_flash.sh: Unified build and flash tool for the Dabao SDK
+#
+# Usage:
+#   ./bao_flash.sh build <example>                         Build only
+#   BAO_MMU=1 ./bao_flash.sh build <example>               Build with the MMU sandbox
+#                                                          (also when examples/<example>/bao_mmu exists)
+#   BAO_RTOS=1 ./bao_flash.sh build <example>              Build with FreeRTOS
+#                                                          (also when examples/<example>/bao_rtos exists)
+#   a file named bao_tinyusb in examples/<example>         Adds TinyUSB, as the usb_cdc example has
+#   BAO_OPT=-O2 ./bao_flash.sh build <example>             Build at another optimisation level
+#   ./bao_flash.sh flash <port> <example>                  Flash (normal, bootwait on)
+#   ./bao_flash.sh flash <port> <example> --persistent     Flash + auto-run on reset
+#   ./bao_flash.sh flash <port> <example> --icsp <dtr>     Zero-button via DTR reset
+#   ./bao_flash.sh flash <port> <example> --icsp-single    Single-port ICSP
+#   ./bao_flash.sh run <port> <example>                    Build + flash in one shot
+#   ./bao_flash.sh run <port> <example> --persistent       Build + flash persistent
+#   ./bao_flash.sh run <port> <example> --icsp <dtr>       Build + flash ICSP
+#   ./bao_flash.sh run <port> <example> --icsp-single      Build + flash single-port ICSP
+#   ./bao_flash.sh list                                    List available examples
+#
+# Examples:
+#   ./bao_flash.sh build blink
+#   ./bao_flash.sh flash /dev/ttyACM0 blink
+#   ./bao_flash.sh flash /dev/ttyACM0 blink --persistent
+#   ./bao_flash.sh flash /dev/ttyACM0 blink --icsp /dev/ttyUSB0
+#   ./bao_flash.sh flash /dev/ttyUSB0 blink --icsp-single
+#   ./bao_flash.sh run /dev/ttyACM0 hello_uart
+
+set -e
+
+# ---- SDK root ----
+# Always run from the SDK root so examples/, src/, tools/, and bao1x.ld
+# resolve correctly even if this script is launched from another directory.
+
+SDK_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$SDK_ROOT"
+
+# ---- Toolchain detection ----
+# Prefer local xPack toolchain inside the SDK, then fall back to PATH.
+#
+# Checks:
+#   1. xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-gcc
+#   2. xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc
+#   3. xpack-riscv-none-elf-gcc-*/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc
+#   4. riscv-none-elf-gcc from PATH
+
+CROSS=""
+
+LOCAL_CROSS="xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-"
+LOCAL_GCC="${LOCAL_CROSS}gcc"
+
+if [ -x "$LOCAL_GCC" ]; then
+    CROSS="$LOCAL_CROSS"
+    echo "Using local xPack toolchain."
+    echo "  $SDK_ROOT/$LOCAL_GCC"
+else
+    for d in xpack-riscv-none-elf-gcc-*; do
+        if [ -z "$CROSS" ] && [ -x "$d/bin/riscv-none-elf-gcc" ]; then
+            CROSS="$d/bin/riscv-none-elf-"
+            echo "Using local xPack toolchain."
+            echo "  $SDK_ROOT/$d/bin/riscv-none-elf-gcc"
+        fi
+
+        for e in "$d"/xpack-riscv-none-elf-gcc-*; do
+            if [ -z "$CROSS" ] && [ -x "$e/bin/riscv-none-elf-gcc" ]; then
+                CROSS="$e/bin/riscv-none-elf-"
+                echo "Using local xPack toolchain."
+                echo "  $SDK_ROOT/$e/bin/riscv-none-elf-gcc"
+            fi
+        done
+    done
+fi
+
+if [ -z "$CROSS" ]; then
+    if command -v riscv-none-elf-gcc >/dev/null 2>&1; then
+        CROSS="riscv-none-elf-"
+        echo "Using RISC-V toolchain from PATH."
+    else
+        echo "ERROR: RISC-V toolchain not found."
+        echo
+        echo "Tried local toolchain:"
+        echo "  $SDK_ROOT/$LOCAL_GCC"
+        echo "  $SDK_ROOT/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc"
+        echo "  $SDK_ROOT/xpack-riscv-none-elf-gcc-*/xpack-riscv-none-elf-gcc-*/bin/riscv-none-elf-gcc"
+        echo
+        echo "Also tried PATH:"
+        echo "  riscv-none-elf-gcc"
+        echo
+        echo "Fix:"
+        echo "  1. Put xpack-riscv-none-elf-gcc-15.2.0-1 beside bao_flash.sh, or"
+        echo "  2. Add riscv-none-elf-gcc to PATH."
+        exit 1
+    fi
+fi
+
+ARCH="-march=rv32imac_zicsr_zifencei -mabi=ilp32"
+# -fno-tree-loop-distribute-patterns: at -O2 and above GCC turns the SDK's
+# own memset/memcpy loops into calls to themselves, the stack runs through
+# SRAM, and that build killed a board. Rovari Studio passes the same flag.
+CFLAGS="${BAO_OPT:--Os} -Wall -Wextra -ffreestanding -nostdlib -fno-tree-loop-distribute-patterns -g"
+
+INC="-Isrc/common/bao_base/include"
+INC="$INC -Isrc/common/bao_stdlib/include"
+INC="$INC -Isrc/bao1x/hardware_regs/include"
+INC="$INC -Isrc/bao1x/hardware_gpio/include"
+INC="$INC -Isrc/bao1x/hardware_uart/include"
+INC="$INC -Isrc/bao1x/hardware_pwm/include"
+INC="$INC -Isrc/bao1x/hardware_spi/include"
+INC="$INC -Isrc/bao1x/hardware_i2c/include"
+INC="$INC -Isrc/bao1x/hardware_adc/include"
+INC="$INC -Isrc/bao1x/hardware_trng/include"
+INC="$INC -Isrc/bao1x/hardware_wdt/include"
+INC="$INC -Isrc/bao1x/hardware_rtc/include"
+INC="$INC -Isrc/bao1x/hardware_power/include"
+INC="$INC -Isrc/bao1x/hardware_bio/include"
+INC="$INC -Isrc/bao1x/hardware_timer/include"
+INC="$INC -Isrc/bao1x/hardware_bio_dma/include"
+INC="$INC -Isrc/bao1x/hardware_irq/include"
+INC="$INC -Isrc/bao1x/hardware_rram/include"
+INC="$INC -Isrc/bao1x/hardware_aes/include"
+INC="$INC -Isrc/bao1x/hardware_sha/include"
+INC="$INC -Isrc/bao1x/hardware_pke/include"
+INC="$INC -Isrc/bao1x/hardware_alu/include"
+INC="$INC -Isrc/bao1x/hardware_sign/include"
+INC="$INC -Isrc/bao1x/hardware_qspi/include"
+INC="$INC -Isrc/bao1x/hardware_w25q/include"
+INC="$INC -Isrc/bao1x/hardware_reset/include"
+INC="$INC -Isrc/boards/include"
+INC="$INC -Isrc/sevs"
+INC="$INC -Ithird_party/fatfs"
+
+# ---- SDK source list ----
+SDK_SRCS="
+    src/bao1x/hardware_gpio/gpio.c
+    src/bao1x/hardware_uart/uart.c
+    src/bao1x/hardware_pwm/pwm.c
+    src/bao1x/hardware_spi/spi.c
+    src/bao1x/hardware_i2c/i2c.c
+    src/bao1x/hardware_adc/adc.c
+    src/bao1x/hardware_trng/trng.c
+    src/bao1x/hardware_wdt/wdt.c
+    src/bao1x/hardware_rtc/rtc.c
+    src/bao1x/hardware_power/power.c
+    src/bao1x/hardware_bio/bio.c
+    src/bao1x/hardware_bio_dma/bio_dma.c
+    src/bao1x/hardware_irq/irq.c
+    src/bao1x/hardware_rram/rram.c
+    src/bao1x/hardware_aes/aes.c
+    src/bao1x/hardware_sha/sha.c
+    src/bao1x/hardware_sha/sha_stream.c
+    src/bao1x/hardware_pke/pke.c
+    src/bao1x/hardware_pke/pke_ecc.c
+    src/bao1x/hardware_alu/alu.c
+    src/bao1x/hardware_sign/ecdsa.c
+    src/bao1x/hardware_sign/ed25519.c
+    src/bao1x/hardware_qspi/qspi.c
+    src/bao1x/hardware_w25q/w25q.c
+    src/common/bao_stdlib/stdio.c
+    src/common/bao_stdlib/delay.c
+    src/common/bao_stdlib/stdlib.c
+    src/common/bao_stdlib/events.c
+    src/common/bao_stdlib/forbidden.c
+    src/sevs/sevs_assert_target.c
+"
+
+# ---- FreeRTOS ----
+# BAO_RTOS=1 in the environment, or a file named bao_rtos in the example's
+# folder, adds the FreeRTOS kernel and the Baochip-1x port in
+# third_party/freertos to a normal build. A file named rtos_config.h in the
+# example's folder overrides settings in FreeRTOSConfig.h.
+RTOS_DIR="third_party/freertos"
+RTOS_SRCS="
+    $RTOS_DIR/kernel/tasks.c
+    $RTOS_DIR/kernel/queue.c
+    $RTOS_DIR/kernel/list.c
+    $RTOS_DIR/kernel/timers.c
+    $RTOS_DIR/kernel/event_groups.c
+    $RTOS_DIR/kernel/stream_buffer.c
+    $RTOS_DIR/portable/port.c
+    $RTOS_DIR/portable/heap_4.c
+    $RTOS_DIR/portable/port_bao1x.c
+"
+
+# ---- Functions ----
+
+usage() {
+    echo "bao_flash.sh: Dabao SDK build and flash tool"
+    echo ""
+    echo "Usage:"
+    echo "  ./bao_flash.sh build <example>"
+    echo "  ./bao_flash.sh flash <port> <example> [--persistent|--icsp <dtr>|--icsp-single]"
+    echo "  ./bao_flash.sh run   <port> <example> [--persistent|--icsp <dtr>|--icsp-single]"
+    echo "  ./bao_flash.sh verify"
+    echo "  ./bao_flash.sh list"
+    echo ""
+    echo "Flash modes:"
+    echo "  (default)       Normal flash, bootwait on. Press RESET to re-enter boot1."
+    echo "  --persistent    Auto-run on reset/power cycle. Hold PROG to re-enter boot1."
+    echo "  --icsp <dtr>    Zero-button reflash. DTR port resets board, CDC port flashes."
+    echo "  --icsp-single   Single-port ICSP. CP2104 DTR+TX/RX, no USB cable needed."
+    echo ""
+    echo "Examples:"
+    echo "  ./bao_flash.sh build blink"
+    echo "  ./bao_flash.sh flash /dev/ttyACM0 blink"
+    echo "  ./bao_flash.sh run /dev/ttyACM0 hello_uart --persistent"
+    echo "  ./bao_flash.sh run /dev/ttyACM0 blink --icsp /dev/ttyUSB0"
+    exit 0
+}
+
+list_examples() {
+    local found
+    local d
+
+    echo "Available examples:"
+
+    if [ ! -d examples ]; then
+        echo "  No examples directory found."
+        exit 1
+    fi
+
+    found=0
+
+    for d in examples/*/; do
+        if [ -d "$d" ]; then
+            echo "  $(basename "$d")"
+            found=1
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "  No examples found."
+    fi
+
+    exit 0
+}
+
+do_build() {
+    local EXAMPLE="$1"
+    local EXAMPLE_DIR="examples/$EXAMPLE"
+    local MAIN_SRC=""
+    local EXTRA_OBJS=""
+    local SDK_OBJS=""
+    local f
+    local obj
+
+    if [ ! -d "$EXAMPLE_DIR" ]; then
+        echo "Error: example \"$EXAMPLE\" not found in examples/"
+        exit 1
+    fi
+
+    if [ "${BAO_MMU:-}" = "1" ] || [ -f "$EXAMPLE_DIR/bao_mmu" ]; then
+        do_build_mmu "$EXAMPLE"
+        return
+    fi
+
+    echo ""
+    echo "============================================"
+    echo "  Building: $EXAMPLE"
+    echo "============================================"
+    echo ""
+
+    mkdir -p build
+
+    echo "[0/4] Checking $EXAMPLE for forbidden addresses ..."
+    python3 tools/audit_addresses.py "$EXAMPLE_DIR" || exit 1
+
+    echo "[1/4] Assembling startup ..."
+    ${CROSS}gcc $ARCH -g -c -o build/crt0.o src/runtime/crt0.S
+
+    echo "[2/4] Compiling SDK ..."
+    for f in $SDK_SRCS; do
+        obj="${f%.c}.o"
+        obj="build/${obj//\//_}"
+
+        ${CROSS}gcc $ARCH $CFLAGS $INC -c -o "$obj" "$f"
+
+        SDK_OBJS="$SDK_OBJS $obj"
+    done
+
+    echo "[3/4] Compiling $EXAMPLE ..."
+
+    for f in "$EXAMPLE_DIR"/*.c; do
+        if [ -f "$f" ]; then
+            MAIN_SRC="$f"
+            break
+        fi
+    done
+
+    if [ -z "$MAIN_SRC" ]; then
+        echo "Error: no .c file found in $EXAMPLE_DIR"
+        exit 1
+    fi
+
+    local USE_TINYUSB=""
+    if [ "$EXAMPLE" = "usb_cdc" ] || [ -f "$EXAMPLE_DIR/bao_tinyusb" ]; then
+        USE_TINYUSB=1
+        INC="$INC -I$EXAMPLE_DIR -Ithird_party/tinyusb/src -Ithird_party/tinyusb/src/portable/corigine/udc"
+    fi
+
+    local USE_RTOS=""
+    if [ "${BAO_RTOS:-}" = "1" ] || [ -f "$EXAMPLE_DIR/bao_rtos" ]; then
+        USE_RTOS=1
+        INC="-I$EXAMPLE_DIR $INC -I$RTOS_DIR -I$RTOS_DIR/kernel/include -I$RTOS_DIR/portable"
+    fi
+
+    ${CROSS}gcc $ARCH $CFLAGS $INC -c -o build/main.o "$MAIN_SRC"
+
+    # Third-party libraries
+    if [ -n "$USE_TINYUSB" ]; then
+        echo "       Compiling TinyUSB ..."
+        TUSB_SRCS="
+            third_party/tinyusb/src/tusb.c
+            third_party/tinyusb/src/common/tusb_fifo.c
+            third_party/tinyusb/src/device/usbd.c
+            third_party/tinyusb/src/device/usbd_control.c
+            third_party/tinyusb/src/class/cdc/cdc_device.c
+            third_party/tinyusb/src/portable/corigine/udc/dcd_corigine_udc.c
+        "
+        for f in $TUSB_SRCS; do
+            obj="build/tusb_$(basename "${f%.c}").o"
+            ${CROSS}gcc $ARCH $CFLAGS $INC -c -o "$obj" "$f" || exit 1
+            EXTRA_OBJS="$EXTRA_OBJS $obj"
+        done
+    fi
+    if [ "$EXAMPLE" = "fatfs" ] || grep -q -e '"ff.h"' -e '"diskio.h"' "$MAIN_SRC"; then
+        echo "       Compiling FatFS ..."
+        ${CROSS}gcc $ARCH $CFLAGS $INC -Ithird_party/fatfs -c -o build/ff.o third_party/fatfs/ff.c
+        ${CROSS}gcc $ARCH $CFLAGS $INC -Ithird_party/fatfs -c -o build/diskio.o third_party/fatfs/diskio.c
+        EXTRA_OBJS="build/ff.o build/diskio.o"
+    fi
+
+    if [ -n "$USE_RTOS" ]; then
+        echo "       Compiling FreeRTOS ..."
+        python3 tools/audit_addresses.py "$RTOS_DIR/portable" || exit 1
+        ${CROSS}gcc $ARCH -g $INC -c -o build/rtos_portASM.o "$RTOS_DIR/portable/portASM.S"
+        EXTRA_OBJS="$EXTRA_OBJS build/rtos_portASM.o"
+        for f in $RTOS_SRCS; do
+            obj="build/rtos_$(basename "${f%.c}").o"
+            ${CROSS}gcc $ARCH $CFLAGS $INC -c -o "$obj" "$f" || exit 1
+            EXTRA_OBJS="$EXTRA_OBJS $obj"
+        done
+    fi
+
+    echo "[4/4] Linking $EXAMPLE.uf2 ..."
+    ${CROSS}gcc $ARCH -T bao1x.ld -nostdlib -nostartfiles -Wl,--gc-sections \
+        -o "build/${EXAMPLE}.elf" \
+        build/crt0.o \
+        $SDK_OBJS \
+        build/main.o \
+        $EXTRA_OBJS \
+        -lgcc
+
+    ${CROSS}objcopy -O binary "build/${EXAMPLE}.elf" "build/${EXAMPLE}.bin"
+
+    python3 tools/sign_and_uf2.py "build/${EXAMPLE}.bin" "build/${EXAMPLE}.uf2" 0x60060000 0xa7d76373
+
+    echo ""
+    ${CROSS}size "build/${EXAMPLE}.elf"
+    echo ""
+    echo "============================================"
+    echo "  BUILD SUCCESS: build/${EXAMPLE}.uf2"
+    echo "============================================"
+    echo ""
+}
+
+# ---- BAO_MMU sandbox build ----
+# BAO_MMU=1 in the environment, or a file named bao_mmu in the example's
+# folder, selects it. main runs in supervisor mode under an identity mapped
+# Sv32 page table (src/mmu/bao_mmu.c). The drivers that reach the SCE, the
+# RRAM controller, the CGU, the WDT or the RTC are compiled as machine mode
+# objects (msvc_*.o) with their functions renamed by bao_mmu_mside.h, and
+# supervisor code reaches them through the ecall stubs in bao_mmu_stubs.S.
+# Without BAO_MMU nothing here runs and do_build is unchanged.
+
+MMU_MSIDE_SRCS="
+    src/bao1x/hardware_sha/sha.c
+    src/bao1x/hardware_sha/sha_stream.c
+    src/bao1x/hardware_aes/aes.c
+    src/bao1x/hardware_trng/trng.c
+    src/bao1x/hardware_pke/pke.c
+    src/bao1x/hardware_pke/pke_ecc.c
+    src/bao1x/hardware_alu/alu.c
+    src/bao1x/hardware_sign/ecdsa.c
+    src/bao1x/hardware_sign/ed25519.c
+    src/bao1x/hardware_rram/rram.c
+    src/bao1x/hardware_wdt/wdt.c
+    src/bao1x/hardware_rtc/rtc.c
+    src/bao1x/hardware_power/power.c
+    src/mmu/bao_mmu.c
+"
+
+do_build_mmu() {
+    local EXAMPLE="$1"
+    local EXAMPLE_DIR="examples/$EXAMPLE"
+    local MAIN_SRC=""
+    local EXTRA_OBJS=""
+    local SDK_OBJS=""
+    local MCFLAGS="$CFLAGS -DBAO_MMU=1"
+    local MINC="$INC -Isrc/mmu"
+    local f
+    local obj
+    local side
+
+    echo ""
+    echo "============================================"
+    echo "  Building: $EXAMPLE (BAO_MMU sandbox)"
+    echo "============================================"
+    echo ""
+
+    mkdir -p build
+
+    echo "[0/4] Checking $EXAMPLE for forbidden addresses ..."
+    python3 tools/audit_addresses.py "$EXAMPLE_DIR" || exit 1
+
+    echo "[1/4] Assembling startup and service stubs ..."
+    ${CROSS}gcc $ARCH -g -DBAO_MMU=1 -c -o build/mmu_crt0.o src/runtime/crt0_mmu.S
+    ${CROSS}gcc $ARCH -g -DBAO_MMU=1 -Isrc/mmu -c -o build/mmu_stubs.o src/mmu/bao_mmu_stubs.S
+
+    echo "[2/4] Compiling SDK (machine mode drivers as msvc_*.o) ..."
+    for f in $SDK_SRCS src/mmu/bao_mmu.c; do
+        side="mmu_s"
+        case "$MMU_MSIDE_SRCS" in
+            *"$f"*) side="msvc" ;;
+        esac
+        obj="${f%.c}.o"
+        obj="build/${side}_${obj//\//_}"
+
+        if [ "$side" = "msvc" ]; then
+            ${CROSS}gcc $ARCH $MCFLAGS $MINC -include src/mmu/bao_mmu_mside.h -c -o "$obj" "$f"
+        else
+            ${CROSS}gcc $ARCH $MCFLAGS $MINC -c -o "$obj" "$f"
+        fi
+
+        SDK_OBJS="$SDK_OBJS $obj"
+    done
+
+    echo "[3/4] Compiling $EXAMPLE ..."
+
+    for f in "$EXAMPLE_DIR"/*.c; do
+        if [ -f "$f" ]; then
+            MAIN_SRC="$f"
+            break
+        fi
+    done
+
+    if [ -z "$MAIN_SRC" ]; then
+        echo "Error: no .c file found in $EXAMPLE_DIR"
+        exit 1
+    fi
+
+    ${CROSS}gcc $ARCH $MCFLAGS $MINC -c -o build/mmu_main.o "$MAIN_SRC"
+
+    if [ "$EXAMPLE" = "fatfs" ] || grep -q -e '"ff.h"' -e '"diskio.h"' "$MAIN_SRC"; then
+        echo "       Compiling FatFS ..."
+        ${CROSS}gcc $ARCH $MCFLAGS $MINC -Ithird_party/fatfs -c -o build/mmu_ff.o third_party/fatfs/ff.c
+        ${CROSS}gcc $ARCH $MCFLAGS $MINC -Ithird_party/fatfs -c -o build/mmu_diskio.o third_party/fatfs/diskio.c
+        EXTRA_OBJS="build/mmu_ff.o build/mmu_diskio.o"
+    fi
+
+    echo "[4/4] Linking $EXAMPLE.uf2 ..."
+    ${CROSS}gcc $ARCH -T bao1x_mmu.ld -nostdlib -nostartfiles -Wl,--gc-sections \
+        -o "build/${EXAMPLE}.elf" \
+        build/mmu_crt0.o \
+        build/mmu_stubs.o \
+        $SDK_OBJS \
+        build/mmu_main.o \
+        $EXTRA_OBJS \
+        -lgcc
+
+    ${CROSS}objcopy -O binary "build/${EXAMPLE}.elf" "build/${EXAMPLE}.bin"
+
+    python3 tools/sign_and_uf2.py "build/${EXAMPLE}.bin" "build/${EXAMPLE}.uf2" 0x60060000 0xa7d76373
+
+    echo ""
+    ${CROSS}size "build/${EXAMPLE}.elf"
+    echo ""
+    echo "============================================"
+    echo "  BUILD SUCCESS: build/${EXAMPLE}.uf2 (BAO_MMU sandbox)"
+    echo "============================================"
+    echo ""
+}
+
+do_flash() {
+    local PORT="$1"
+    local EXAMPLE="$2"
+    local UF2
+    local DTR_PORT
+
+    shift 2
+
+    UF2="build/${EXAMPLE}.uf2"
+
+    if [ ! -f "$UF2" ]; then
+        echo "Error: $UF2 not found. Run \"./bao_flash.sh build $EXAMPLE\" first."
+        exit 1
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --persistent)
+                echo "Flashing $UF2 via $PORT (persistent mode) ..."
+                python3 tools/serial_flash.py --persistent "$PORT" "$UF2"
+                return
+                ;;
+            --icsp)
+                if [ -z "$2" ]; then
+                    echo "Error: --icsp requires a DTR port argument"
+                    exit 1
+                fi
+                DTR_PORT="$2"
+                shift
+                echo "Flashing $UF2 via $DTR_PORT + $PORT (ICSP mode) ..."
+                python3 tools/serial_flash.py --icsp "$DTR_PORT" "$PORT" "$UF2"
+                return
+                ;;
+            --icsp-single)
+                echo "Flashing $UF2 via $PORT (single-port ICSP) ..."
+                python3 tools/serial_flash.py --icsp-single "$PORT" "$UF2"
+                return
+                ;;
+            *)
+                echo "Unknown flash option: $1"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # Default: normal flash
+    echo "Flashing $UF2 via $PORT ..."
+    python3 tools/serial_flash.py "$PORT" "$UF2"
+}
+
+do_verify() {
+    python3 tools/sevs/verify.py
+}
+
+# ---- Main ----
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+    build)
+        if [ -z "$1" ]; then
+            echo "Usage: ./bao_flash.sh build <example>"
+            exit 1
+        fi
+        do_build "$1"
+        ;;
+    flash)
+        if [ -z "$2" ]; then
+            echo "Usage: ./bao_flash.sh flash <port> <example> [--persistent|--icsp <dtr>|--icsp-single]"
+            exit 1
+        fi
+        do_flash "$@"
+        ;;
+    run)
+        if [ -z "$2" ]; then
+            echo "Usage: ./bao_flash.sh run <port> <example> [--persistent|--icsp <dtr>|--icsp-single]"
+            exit 1
+        fi
+        PORT="$1"
+        EXAMPLE="$2"
+        shift 2
+        do_build "$EXAMPLE"
+        do_flash "$PORT" "$EXAMPLE" "$@"
+        ;;
+    list)
+        list_examples
+        ;;
+    verify)
+        do_verify
+        ;;
+    *)
+        echo "Unknown command: $CMD"
+        echo ""
+        usage
+        ;;
+esac

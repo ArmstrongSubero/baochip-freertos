@@ -50,7 +50,7 @@ static void on_edge(uint32_t pending)
     (void)pending;
     BaseType_t woken = pdFALSE;
 
-    IOX_INTFR = 1;
+    IOX_INTFR = 0x80;
     if (gives >= 40) {
         return;
     }
@@ -89,7 +89,7 @@ static void runner(void *arg)
     gpio_set_dir(GPIO_PORT_B, WAKE_PIN, false);
     gpio_pull_up(GPIO_PORT_B, WAKE_PIN);
     IOX_INTCR0 = (1u << 9) | (1u << 7) | (16 + WAKE_PIN);
-    IOX_INTFR = 1;
+    IOX_INTFR = 0x80;
     irq_set_handler(IRQ_ARRAY10, on_edge);
     irq_enable_events(IRQ_ARRAY10, 1);
 
